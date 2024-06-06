@@ -19,6 +19,7 @@ import torch.optim as optim
 import os
 import torch.nn.functional as F
 
+import loralib as lora
 
 import glob
 import cv2
@@ -59,8 +60,6 @@ def blending (fake_out, source_clip, train_data):
     
     return torch.tensor(result_clip).cuda()
 
-
-
 if __name__ == "__main__":
     '''
             clip training code of DINet
@@ -73,9 +72,21 @@ if __name__ == "__main__":
     np.random.seed(opt.seed)
     torch.cuda.manual_seed(opt.seed)
     # load training data
-    train_data = DINetDataset(opt.train_data,opt.augment_num,opt.mouth_region_size)
+    train_data = DINetDataset(opt.train_data, opt.train_data_org, opt.augment_num,opt.mouth_region_size)
+    #train_data_org = DINetDataset(opt.train_data_org,opt.augment_num,opt.mouth_region_size)
+
+    #print(train_data)
+    #print(train_data_org)
     training_data_loader = DataLoader(dataset=train_data,  batch_size=opt.batch_size, shuffle=True,drop_last=True)
     train_data_length = len(training_data_loader)
+
+
+    # load original training data
+    #train_data_org = DINetDataset(opt.train_data_org,opt.augment_num,opt.mouth_region_size)
+    #training_data_loader_org = DataLoader(dataset=train_data_org,  batch_size=opt.batch_size, shuffle=True,drop_last=True)
+    #train_data_length_org = len(training_data_loader_org)
+
+
     # init network
     net_g = DINet(opt.source_channel,opt.ref_channel,opt.audio_channel).cuda()
     net_dI = Discriminator(opt.source_channel ,opt.D_block_expansion, opt.D_num_blocks, opt.D_max_features).cuda()
@@ -89,19 +100,21 @@ if __name__ == "__main__":
     net_dV = nn.DataParallel(net_dV)
     net_vgg = nn.DataParallel(net_vgg)
     # setup optimizer
-    optimizer_g = optim.Adam(net_g.parameters(), lr=opt.lr_g)
-    optimizer_dI = optim.Adam(net_dI.parameters(), lr=opt.lr_dI)
-    optimizer_dV = optim.Adam(net_dV.parameters(), lr=opt.lr_dI)
+    optimizer_g = optim.AdamW(net_g.parameters(), lr=opt.lr_g, weight_decay=0)
+    optimizer_dI = optim.AdamW(net_dI.parameters(), lr=opt.lr_dI, weight_decay=0)
+    optimizer_dV = optim.AdamW(net_dV.parameters(), lr=opt.lr_dI, weight_decay=0)
     ## load frame trained DInet weight
     print('loading frame trained DINet weight from: {}'.format(opt.pretrained_frame_DINet_path))
-    checkpoint = torch.load(opt.pretrained_frame_DINet_path)
-    net_g.load_state_dict(checkpoint['state_dict']['net_g'])
-    net_dI.load_state_dict(checkpoint['state_dict']['net_dI'])
-    net_dV.load_state_dict(checkpoint['state_dict']['net_dV'])
 
-    optimizer_g.load_state_dict(checkpoint['optimizer']['net_g'])
-    optimizer_dI.load_state_dict(checkpoint['optimizer']['net_dI'])
-    optimizer_dV.load_state_dict(checkpoint['optimizer']['net_dV'])
+    checkpoint = torch.load(opt.pretrained_frame_DINet_path)
+
+    net_g.load_state_dict(checkpoint['state_dict']['net_g'], strict=False)
+    net_dI.load_state_dict(checkpoint['state_dict']['net_dI'], strict=False)
+    net_dV.load_state_dict(checkpoint['state_dict']['net_dV'], strict=False)
+
+    #optimizer_g.load_state_dict(checkpoint['optimizer']['net_g'])
+    #optimizer_dI.load_state_dict(checkpoint['optimizer']['net_dI'])
+    #optimizer_dV.load_state_dict(checkpoint['optimizer']['net_dV'])
     # set criterion
     criterionGAN = GANLoss().cuda()
     criterionL1 = nn.L1Loss().cuda()
@@ -114,12 +127,13 @@ if __name__ == "__main__":
     #opt.non_decay = opt.start_epoch//3 
     #opt.decay = opt.start_epoch - opt.non_decay
 
-    #print(opt.non_decay, opt.decay)
+    print( opt.non_decay, opt.decay)
 
+    
     # set scheduler
-    net_g_scheduler = get_scheduler(optimizer_g, opt.non_decay, opt.decay)
-    net_dI_scheduler = get_scheduler(optimizer_dI, opt.non_decay, opt.decay)
-    net_dV_scheduler = get_scheduler(optimizer_dV, opt.non_decay, opt.decay)
+    net_g_scheduler = get_scheduler(optimizer_g, opt.non_decay, opt.decay, lr_policy = 'cosine')
+    net_dI_scheduler = get_scheduler(optimizer_dI, opt.non_decay, opt.decay, lr_policy = 'cosine')
+    net_dV_scheduler = get_scheduler(optimizer_dV, opt.non_decay, opt.decay, lr_policy = 'cosine')
     # set label of syncnet perception loss
     real_tensor = torch.tensor(1.0).cuda()
 
@@ -144,13 +158,15 @@ if __name__ == "__main__":
     for epoch in range(opt.start_epoch, opt.non_decay+opt.decay+1):
         #epoch+=1
         net_g.train()
+        lora.mark_only_lora_as_trainable(net_g)
+
         for iteration, data in enumerate(training_data_loader):
             # forward
             source_clip,source_clip_mask, reference_clip,deep_speech_clip,deep_speech_full = data
-            print(source_clip.shape)
-            print(reference_clip.shape)
-            print(deep_speech_clip.shape)
-            print("--------------------------------")
+            #print(source_clip.shape)
+            #print(reference_clip.shape)
+            #print(deep_speech_clip.shape)
+            #print("--------------------------------")
             source_clip = torch.cat(torch.split(source_clip, 1, dim=1), 0).squeeze(1).float().cuda()
             #frame_clip = torch.cat(torch.split(frame_clip, 1, dim=1), 0).squeeze(1).float().cuda()
             #landmark = torch.cat(torch.split(landmark, 1, dim=1), 0).squeeze(1).float().cuda()
@@ -160,21 +176,10 @@ if __name__ == "__main__":
             
             deep_speech_clip = torch.cat(torch.split(deep_speech_clip, 1, dim=1), 0).squeeze(1).float().cuda()
             deep_speech_full = deep_speech_full.float().cuda()
-
-            print(source_clip.shape)
-            print(reference_clip.shape)
-            print(deep_speech_clip.shape)
-            
-            exit()
             fake_out = net_g(source_clip_mask,reference_clip,deep_speech_clip)
 
             blended_clip = blending(fake_out, source_clip, train_data)
             blended_clip_half = F.interpolate(blended_clip, scale_factor=0.5, mode='bilinear')
-
-            #print("--------------------------------")
-            #print(blended_clip.shape)
-            #print(fake_out.shape)
-            #print("--------------------------------")
 
             fake_out_half = F.avg_pool2d(fake_out, 3, 2, 1, count_include_pad=False)
             source_clip_half = F.interpolate(source_clip, scale_factor=0.5, mode='bilinear')
@@ -230,13 +235,6 @@ if __name__ == "__main__":
                 loss_g_perception_blend += criterionL1(perception_blended[i], perception_real[i])
                 loss_g_perception_blend += criterionL1(perception_blended_half[i], perception_real_half[i])
             
-            #loss_g_perception_ssim = 0
-            #for i in range(len(perception_real)):
-            #    loss_g_perception_ssim += criterionSSIM(perception_blended[i], perception_real[i])
-            
-            #print(loss_g_perception_ssim)
-                
-            
             loss_g_perception = (loss_g_perception*0.6 + loss_g_perception_blend*0.4/ (len(perception_real) * 2)) * opt.lamb_perception
        
             # # gan dI loss
@@ -247,25 +245,12 @@ if __name__ == "__main__":
             fake_out_clip = torch.cat(torch.split(fake_out, opt.batch_size, dim=0), 1)
             blend_out_clip = torch.cat(torch.split(blended_clip, opt.batch_size, dim=0), 1)
 
-            #print("--------------------------------")
-            #print(fake_out_clip.shape)
-            #print(blend_out_clip.shape)
-            #print("--------------------------------")
-
             fake_out_clip_mouth = fake_out_clip[:, :, train_data.radius:train_data.radius + train_data.mouth_region_size,
             train_data.radius_1_4:train_data.radius_1_4 + train_data.mouth_region_size]
-            sync_score_fake = net_lipsync(fake_out_clip_mouth, deep_speech_full)
-
-            blend_out_clip_mouth = blend_out_clip[:, :, train_data.radius:train_data.radius + train_data.mouth_region_size,
-            train_data.radius_1_4:train_data.radius_1_4 + train_data.mouth_region_size]
-            sync_score_blend = net_lipsync(blend_out_clip_mouth, deep_speech_full)
-
-            sync_score = 0.6*sync_score_fake + 0.4*sync_score_blend
+            sync_score = net_lipsync(fake_out_clip_mouth, deep_speech_full)
 
             loss_sync = criterionMSE(sync_score, real_tensor.expand_as(sync_score))* opt.lamb_syncnet_perception
-            
-
-
+    
             # combine all losses
             loss_g =   loss_g_perception + loss_g_dI +loss_g_dV + loss_sync
             loss_g.backward()
@@ -286,7 +271,7 @@ if __name__ == "__main__":
 
             universal_checkpoint+=1
 
-        exit()    
+           
         update_learning_rate(net_g_scheduler, optimizer_g)
         update_learning_rate(net_dI_scheduler, optimizer_dI)
         update_learning_rate(net_dV_scheduler, optimizer_dV)
@@ -301,4 +286,5 @@ if __name__ == "__main__":
                 'optimizer': {'net_g': optimizer_g.state_dict(), 'net_dI': optimizer_dI.state_dict(), 'net_dV': optimizer_dV.state_dict()}
             }
             torch.save(states, model_out_path)
+            #torch.save(lora.lora_state_dict(net_g.state_dict()), model_out_path.split(".p")[0]+"_lora.pth")
             print("Checkpoint saved to {}".format(epoch))
